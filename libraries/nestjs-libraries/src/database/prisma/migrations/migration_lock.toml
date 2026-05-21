@@ -1,0 +1,4 @@
+# Prisma migration lock — bloqueado a postgresql porque el upstream Postiz
+# usa Postgres via DATABASE_URL. NO cambiar provider; cualquier cambio
+# requiere un baseline manual.
+provider = "postgresql"

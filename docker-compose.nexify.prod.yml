@@ -1,0 +1,185 @@
+# Nexify Postiz — Docker Compose productivo aislado
+# Uso: docker compose -f docker-compose.nexify.prod.yml --env-file .env.nexify.production up -d
+#
+# Reglas:
+# - Sólo la app expone un puerto, y sólo en 127.0.0.1 (Nginx del host hace el proxy)
+# - Todo lo demás es interno a la red nexify-postiz-network
+# - Nombres de contenedor, red y volúmenes prefijados para no chocar con otras apps
+
+name: nexify-postiz
+
+services:
+  nexify-postiz-app:
+    # Imagen propia construida por GitHub Actions (.github/workflows/build-nexpost-image.yml)
+    # desde Dockerfile.dev (mismo que upstream usa para su imagen oficial).
+    # Para rollback rápido a la oficial: cambiar a ghcr.io/gitroomhq/postiz-app:latest
+    image: ghcr.io/luisrepi/nexify-postiz:latest
+    container_name: nexify-postiz-app
+    restart: unless-stopped
+    env_file:
+      - .env.nexify.production
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@nexify-postiz-postgres:5432/${POSTGRES_DB}"
+      REDIS_URL: "redis://nexify-postiz-redis:6379"
+      TEMPORAL_ADDRESS: "nexify-postiz-temporal:7233"
+      BACKEND_INTERNAL_URL: "http://localhost:3000"
+      STORAGE_PROVIDER: "${STORAGE_PROVIDER:-local}"
+      UPLOAD_DIRECTORY: "/uploads"
+      NEXT_PUBLIC_UPLOAD_DIRECTORY: "/uploads"
+    volumes:
+      - nexify-postiz-config:/config/
+      - nexify-postiz-uploads:/uploads/
+      # White-label de assets — bind mount sobre la imagen.
+      # Reemplaza tanto los nombres genéricos (logo, favicon) como los con marca Postiz
+      # que la app referencia internamente (postiz.svg, postiz-text.svg, postiz-fav.png).
+      - ./branding/nexify/favicon.ico:/app/apps/frontend/public/favicon.ico:ro
+      - ./branding/nexify/favicon.png:/app/apps/frontend/public/favicon.png:ro
+      - ./branding/nexify/favicon.svg:/app/apps/frontend/public/favicon.svg:ro
+      - ./branding/nexify/logo.svg:/app/apps/frontend/public/logo.svg:ro
+      - ./branding/nexify/logo-text.svg:/app/apps/frontend/public/logo-text.svg:ro
+      - ./branding/nexify/postiz.svg:/app/apps/frontend/public/postiz.svg:ro
+      - ./branding/nexify/postiz-text.svg:/app/apps/frontend/public/postiz-text.svg:ro
+      - ./branding/nexify/favicon.png:/app/apps/frontend/public/postiz-fav.png:ro
+      - ./branding/nexify/og-image.svg:/app/apps/frontend/public/og-image.svg:ro
+    ports:
+      # Sólo accesible desde el host. Nginx hace el proxy.
+      - "127.0.0.1:4077:5000"
+    networks:
+      - nexify-postiz-network
+      # Red externa del stack existente (agentsaas) para que su nginx
+      # pueda alcanzar a nexify-postiz-app por nombre de contenedor.
+      - agentsaas_default
+    depends_on:
+      nexify-postiz-postgres:
+        condition: service_healthy
+      nexify-postiz-redis:
+        condition: service_healthy
+      nexify-postiz-temporal:
+        condition: service_started
+    healthcheck:
+      # Postiz root responde 307 → /auth. La imagen no trae curl/wget, pero sí node.
+      # Aceptamos 200/301/302/307/308 como éxito.
+      test:
+        - CMD-SHELL
+        - >-
+          node -e "require('http').get('http://localhost:5000/',r=>process.exit([200,301,302,307,308].indexOf(r.statusCode)>=0?0:1)).on('error',()=>process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  nexify-postiz-postgres:
+    image: postgres:17-alpine
+    container_name: nexify-postiz-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      POSTGRES_DB: "${POSTGRES_DB}"
+    volumes:
+      - nexify-postiz-postgres-data:/var/lib/postgresql/data
+    networks:
+      - nexify-postiz-network
+    # Sin ports: sólo accesible dentro de la red Docker
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  nexify-postiz-redis:
+    image: redis:7.2-alpine
+    container_name: nexify-postiz-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - nexify-postiz-redis-data:/data
+    networks:
+      - nexify-postiz-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  nexify-postiz-temporal-postgres:
+    image: postgres:16-alpine
+    container_name: nexify-postiz-temporal-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: "${TEMPORAL_DB_PASSWORD}"
+      POSTGRES_DB: temporal
+    volumes:
+      - nexify-postiz-temporal-postgres-data:/var/lib/postgresql/data
+    networks:
+      - nexify-postiz-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  nexify-postiz-temporal-elasticsearch:
+    image: elasticsearch:7.17.27
+    container_name: nexify-postiz-temporal-elasticsearch
+    restart: unless-stopped
+    environment:
+      - cluster.routing.allocation.disk.threshold_enabled=true
+      - cluster.routing.allocation.disk.watermark.low=512mb
+      - cluster.routing.allocation.disk.watermark.high=256mb
+      - cluster.routing.allocation.disk.watermark.flood_stage=128mb
+      - discovery.type=single-node
+      - ES_JAVA_OPTS=-Xms256m -Xmx256m
+      - xpack.security.enabled=false
+    volumes:
+      - nexify-postiz-temporal-es-data:/usr/share/elasticsearch/data
+    networks:
+      - nexify-postiz-network
+
+  nexify-postiz-temporal:
+    image: temporalio/auto-setup:1.28.1
+    container_name: nexify-postiz-temporal
+    restart: unless-stopped
+    depends_on:
+      nexify-postiz-temporal-postgres:
+        condition: service_healthy
+      nexify-postiz-temporal-elasticsearch:
+        condition: service_started
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: "${TEMPORAL_DB_PASSWORD}"
+      POSTGRES_SEEDS: nexify-postiz-temporal-postgres
+      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
+      TEMPORAL_NAMESPACE: default
+      ENABLE_ES: "true"
+      ES_SEEDS: nexify-postiz-temporal-elasticsearch
+      ES_VERSION: v7
+    volumes:
+      - ./dynamicconfig:/etc/temporal/config/dynamicconfig:ro
+    networks:
+      - nexify-postiz-network
+
+volumes:
+  nexify-postiz-postgres-data:
+    name: nexify-postiz-postgres-data
+  nexify-postiz-redis-data:
+    name: nexify-postiz-redis-data
+  nexify-postiz-config:
+    name: nexify-postiz-config
+  nexify-postiz-uploads:
+    name: nexify-postiz-uploads
+  nexify-postiz-temporal-postgres-data:
+    name: nexify-postiz-temporal-postgres-data
+  nexify-postiz-temporal-es-data:
+    name: nexify-postiz-temporal-es-data
+
+networks:
+  nexify-postiz-network:
+    name: nexify-postiz-network
+    driver: bridge
+  agentsaas_default:
+    external: true
+    name: agentsaas_default
